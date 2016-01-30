@@ -11,12 +11,15 @@ import (
 	"github.com/tools/godep/Godeps/_workspace/src/golang.org/x/tools/go/vcs"
 )
 
+// VCS represents a version control system.
 type VCS struct {
 	vcs *vcs.Cmd
 
 	IdentifyCmd string
 	DescribeCmd string
 	DiffCmd     string
+	ListCmd     string
+	RootCmd     string
 
 	// run in sandbox repos
 	ExistsCmd string
@@ -28,6 +31,8 @@ var vcsBzr = &VCS{
 	IdentifyCmd: "version-info --custom --template {revision_id}",
 	DescribeCmd: "revno", // TODO(kr): find tag names if possible
 	DiffCmd:     "diff -r {rev}",
+	ListCmd:     "ls --from-root -R",
+	RootCmd:     "root",
 }
 
 var vcsGit = &VCS{
@@ -36,6 +41,8 @@ var vcsGit = &VCS{
 	IdentifyCmd: "rev-parse HEAD",
 	DescribeCmd: "describe --tags",
 	DiffCmd:     "diff {rev}",
+	ListCmd:     "ls-files --full-name",
+	RootCmd:     "rev-parse --show-toplevel",
 
 	ExistsCmd: "cat-file -e {rev}",
 }
@@ -43,9 +50,11 @@ var vcsGit = &VCS{
 var vcsHg = &VCS{
 	vcs: vcs.ByCmd("hg"),
 
-	IdentifyCmd: "identify --id --debug",
+	IdentifyCmd: "parents --template '{node}'",
 	DescribeCmd: "log -r . --template {latesttag}-{latesttagdistance}",
 	DiffCmd:     "diff -r {rev}",
+	ListCmd:     "status --all --no-status",
+	RootCmd:     "root",
 
 	ExistsCmd: "cat -r {rev} .",
 }
@@ -56,6 +65,7 @@ var cmd = map[*vcs.Cmd]*VCS{
 	vcsHg.vcs:  vcsHg,
 }
 
+// VCSFromDir returns a VCS value from a directory.
 func VCSFromDir(dir, srcRoot string) (*VCS, string, error) {
 	vcscmd, reporoot, err := vcs.FromDir(dir, srcRoot)
 	if err != nil {
@@ -68,8 +78,9 @@ func VCSFromDir(dir, srcRoot string) (*VCS, string, error) {
 	return vcsext, reporoot, nil
 }
 
+// VCSForImportPath returns a VCS value for an import path.
 func VCSForImportPath(importPath string) (*VCS, error) {
-	rr, err := vcs.RepoRootForImportPath(importPath, false)
+	rr, err := vcs.RepoRootForImportPath(importPath, debug)
 	if err != nil {
 		return nil, err
 	}
@@ -85,6 +96,11 @@ func (v *VCS) identify(dir string) (string, error) {
 	return string(bytes.TrimSpace(out)), err
 }
 
+func (v *VCS) root(dir string) (string, error) {
+	out, err := v.runOutput(dir, v.RootCmd)
+	return string(bytes.TrimSpace(out)), err
+}
+
 func (v *VCS) describe(dir, rev string) string {
 	out, err := v.runOutputVerboseOnly(dir, v.DescribeCmd, "rev", rev)
 	if err != nil {
@@ -96,6 +112,58 @@ func (v *VCS) describe(dir, rev string) string {
 func (v *VCS) isDirty(dir, rev string) bool {
 	out, err := v.runOutput(dir, v.DiffCmd, "rev", rev)
 	return err != nil || len(out) != 0
+}
+
+type vcsFiles map[string]bool
+
+func (vf vcsFiles) Contains(path string) bool {
+	// Fast path, we have the path
+	if vf[path] {
+		return true
+	}
+
+	// Slow path for case insensitive filesystems
+	// See #310
+	for f := range vf {
+		if strings.EqualFold(f, path) {
+			return true
+		}
+		// git's root command (maybe other vcs as well) resolve symlinks, so try that too
+		// FIXME: rev-parse --show-cdup + extra logic will fix this for git but also need to validate the other vcs commands. This is maybe temporary.
+		p, err := filepath.EvalSymlinks(path)
+		if err != nil {
+			return false
+		}
+		if strings.EqualFold(f, p) {
+			return true
+		}
+	}
+
+	// No matches by either method
+	return false
+}
+
+// listFiles tracked by the VCS in the repo that contains dir, converted to absolute path.
+func (v *VCS) listFiles(dir string) vcsFiles {
+	root, err := v.root(dir)
+	if err != nil {
+		return nil
+	}
+	out, err := v.runOutput(dir, v.ListCmd)
+	if err != nil {
+		return nil
+	}
+	files := make(vcsFiles)
+	for _, file := range bytes.Split(out, []byte{'\n'}) {
+		if len(file) > 0 {
+			path, err := filepath.Abs(filepath.Join(string(root), string(file)))
+			if err != nil {
+				panic(err) // this should not happen
+			}
+			files[path] = true
+		}
+	}
+	return files
 }
 
 func (v *VCS) exists(dir, rev string) bool {

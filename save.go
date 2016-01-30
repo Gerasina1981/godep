@@ -3,8 +3,9 @@ package main
 import (
 	"bufio"
 	"bytes"
-	"encoding/json"
 	"errors"
+	"fmt"
+	"go/build"
 	"io"
 	"io/ioutil"
 	"log"
@@ -17,15 +18,19 @@ import (
 )
 
 var cmdSave = &Command{
-	Usage: "save [-r] [packages]",
+	Name:  "save",
+	Args:  "[-r] [-t] [packages]",
 	Short: "list and copy dependencies into Godeps",
 	Long: `
-Save writes a list of the dependencies of the named packages along
-with the exact source control revision of each dependency, and copies
-their source code into a subdirectory.
+
+Save writes a list of the named packages and their dependencies along
+with the exact source control revision of each package, and copies
+their source code into a subdirectory. Packages inside "." are excluded
+from the list to be copied.
 
 The list is written to Godeps/Godeps.json, and source code for all
-dependencies is copied into Godeps/_workspace.
+dependencies is copied into either Godeps/_workspace or, if the vendor
+experiment is turned on, vendor/.
 
 The dependency list is a JSON document with the following structure:
 
@@ -40,11 +45,16 @@ The dependency list is a JSON document with the following structure:
 		}
 	}
 
-Any dependencies already present in the list will be left unchanged.
+Any packages already present in the list will be left unchanged.
 To update a dependency to a newer revision, use 'godep update'.
 
-If -r is given, import statements will be rewritten to refer
-directly to the copied source code.
+If -r is given, import statements will be rewritten to refer directly
+to the copied source code. This is not compatible with the vendor
+experiment. Note that this will not rewrite the statements in the
+files outside the project.
+
+If -t is given, test files (*_test.go files + testdata directories) are
+also saved.
 
 For more about specifying packages, see 'go help packages'.
 `,
@@ -52,18 +62,18 @@ For more about specifying packages, see 'go help packages'.
 }
 
 var (
-	saveCopy = true
-	saveR    = false
+	saveR, saveT bool
 )
 
 func init() {
-	cmdSave.Flag.BoolVar(&saveCopy, "copy", true, "copy source code")
 	cmdSave.Flag.BoolVar(&saveR, "r", false, "rewrite import paths")
+	cmdSave.Flag.BoolVar(&saveT, "t", false, "save test files")
+
 }
 
 func runSave(cmd *Command, args []string) {
-	if !saveCopy {
-		log.Println("flag unsupported: -copy=false")
+	if VendorExperiment && saveR {
+		log.Println("flag -r is incompatible with the vendoring experiment")
 		cmd.UsageExit()
 	}
 	err := save(args)
@@ -72,47 +82,90 @@ func runSave(cmd *Command, args []string) {
 	}
 }
 
+func dotPackage() (*build.Package, error) {
+	dir, err := filepath.Abs(".")
+	if err != nil {
+		return nil, err
+	}
+	return build.ImportDir(dir, build.FindOnly)
+}
+
+func projectPackages(dDir string, a []*Package) []*Package {
+	var projPkgs []*Package
+	dotDir := fmt.Sprintf("%s%c", dDir, filepath.Separator)
+	for _, p := range a {
+		pkgDir := fmt.Sprintf("%s%c", p.Dir, filepath.Separator)
+		if strings.HasPrefix(pkgDir, dotDir) {
+			projPkgs = append(projPkgs, p)
+		}
+	}
+	return projPkgs
+}
+
 func save(pkgs []string) error {
-	dot, err := LoadPackages(".")
+	dp, err := dotPackage()
 	if err != nil {
 		return err
 	}
-	ver, err := goVersion()
+	debugln("dotPackageImportPath:", dp.ImportPath)
+	debugln("dotPackageDir:", dp.Dir)
+
+	cv, err := goVersion()
 	if err != nil {
 		return err
 	}
-	manifest := filepath.Join("Godeps", "Godeps.json")
-	var gold Godeps
-	oldIsFile, err := readOldGodeps(&gold)
+	debugln("goVersion:", cv)
+
+	gold, err := loadDefaultGodepsFile()
 	if err != nil {
-		return err
+		if !os.IsNotExist(err) {
+			return err
+		}
+		gold.GoVersion = cv
 	}
+
+	printVersionWarnings(gold.GoVersion)
+
 	gnew := &Godeps{
-		ImportPath: dot[0].ImportPath,
-		GoVersion:  ver,
+		ImportPath: dp.ImportPath,
+		GoVersion:  gold.GoVersion,
 	}
-	if len(pkgs) > 0 {
-		gnew.Packages = pkgs
-	} else {
+
+	switch len(pkgs) {
+	case 0:
 		pkgs = []string{"."}
+	default:
+		gnew.Packages = pkgs
 	}
+
 	a, err := LoadPackages(pkgs...)
 	if err != nil {
 		return err
 	}
-	err = gnew.Load(a)
+	debugln("Project Packages", pkgs)
+	ppln(a)
+
+	projA := projectPackages(dp.Dir, a)
+	debugln("Filtered projectPackages")
+	ppln(projA)
+
+	err = gnew.fill(a, dp.ImportPath)
 	if err != nil {
 		return err
 	}
+	debugln("New Godeps Filled")
+	ppln(gnew)
+
 	if gnew.Deps == nil {
 		gnew.Deps = make([]Dependency, 0) // produce json [], not null
 	}
-	gdisk := copyGodeps(gnew)
+	gdisk := gnew.copy()
 	err = carryVersions(&gold, gnew)
 	if err != nil {
 		return err
 	}
-	if oldIsFile {
+
+	if gold.isOldFile {
 		// If we are migrating from an old format file,
 		// we require that the listed version of every
 		// dependency must be installed in GOPATH, so it's
@@ -128,16 +181,7 @@ func save(pkgs []string) error {
 	if err != nil {
 		log.Println(err)
 	}
-	f, err := os.Create(manifest)
-	if err != nil {
-		return err
-	}
-	_, err = gnew.WriteTo(f)
-	if err != nil {
-		f.Close()
-		return err
-	}
-	err = f.Close()
+	_, err = gnew.save()
 	if err != nil {
 		return err
 	}
@@ -145,10 +189,13 @@ func save(pkgs []string) error {
 	// ignores this directory when traversing packages
 	// starting at the project's root. For example,
 	//   godep go list ./...
-	workspace := filepath.Join("Godeps", "_workspace")
-	srcdir := filepath.Join(workspace, "src")
+	srcdir := filepath.FromSlash(strings.Trim(sep, "/"))
 	rem := subDeps(gold.Deps, gnew.Deps)
+	debugln("Deps to remove")
+	ppln(rem)
 	add := subDeps(gnew.Deps, gold.Deps)
+	debugln("Deps to add")
+	ppln(add)
 	err = removeSrc(srcdir, rem)
 	if err != nil {
 		return err
@@ -157,41 +204,59 @@ func save(pkgs []string) error {
 	if err != nil {
 		return err
 	}
-	writeVCSIgnore(workspace)
+	if !VendorExperiment {
+		f, _ := filepath.Split(srcdir)
+		writeVCSIgnore(f)
+	}
 	var rewritePaths []string
 	if saveR {
 		for _, dep := range gnew.Deps {
 			rewritePaths = append(rewritePaths, dep.ImportPath)
 		}
 	}
-	return rewrite(a, dot[0].ImportPath, rewritePaths)
+	debugln("rewritePaths")
+	ppln(rewritePaths)
+	return rewrite(projA, dp.ImportPath, rewritePaths)
 }
 
-func readOldGodeps(g *Godeps) (isFile bool, err error) {
-	f, err := os.Open(filepath.Join("Godeps", "Godeps.json"))
+func printVersionWarnings(ov string) {
+	var warning bool
+	cv, err := goVersion()
 	if err != nil {
-		isFile = true
-		f, err = os.Open("Godeps")
+		return
 	}
-	if os.IsNotExist(err) {
-		return false, nil
-	}
+	tov, err := trimGoVersion(ov)
 	if err != nil {
-		return false, err
+		return
 	}
-	err = json.NewDecoder(f).Decode(g)
-	f.Close()
-	return isFile, err
+	tcv, err := trimGoVersion(cv)
+	if err != nil {
+		return
+	}
+
+	if tov != ov {
+		log.Printf("WARNING: Recorded go version (%s) with minor version string found.\n", ov)
+		warning = true
+	}
+	if tcv != tov {
+		log.Printf("WARNING: Recorded major go version (%s) and in-use major go version (%s) differ.\n", tov, tcv)
+		warning = true
+	}
+	if warning {
+		log.Println("To record current major go version run `godep update -goversion`.")
+	}
 }
 
 type revError struct {
 	ImportPath string
-	HaveRev    string
 	WantRev    string
+	HavePath   string
+	HaveRev    string
 }
 
 func (v *revError) Error() string {
-	return v.ImportPath + ": revision is " + v.HaveRev + ", want " + v.WantRev
+	return fmt.Sprintf("cannot save %s at revision %s: already have %s at revision %s.\n"+
+		"Run `godep update %s' first.", v.ImportPath, v.WantRev, v.HavePath, v.HaveRev, v.HavePath)
 }
 
 // carryVersions copies Rev and Comment from a to b for
@@ -222,14 +287,15 @@ func carryVersion(a *Godeps, db *Dependency) error {
 	// We can't handle mismatched versions for packages in
 	// the same repo, so report that as an error.
 	for _, da := range a.Deps {
-		switch {
-		case strings.HasPrefix(db.ImportPath, da.ImportPath+"/"):
+		if strings.HasPrefix(db.ImportPath, da.ImportPath+"/") ||
+			strings.HasPrefix(da.ImportPath, db.root+"/") {
 			if da.Rev != db.Rev {
-				return &revError{db.ImportPath, db.Rev, da.Rev}
-			}
-		case strings.HasPrefix(da.ImportPath, db.root+"/"):
-			if da.Rev != db.Rev {
-				return &revError{db.ImportPath, db.Rev, da.Rev}
+				return &revError{
+					ImportPath: db.ImportPath,
+					WantRev:    db.Rev,
+					HavePath:   da.ImportPath,
+					HaveRev:    da.Rev,
+				}
 			}
 		}
 	}
@@ -263,6 +329,8 @@ func removeSrc(srcdir string, deps []Dependency) error {
 }
 
 func copySrc(dir string, deps []Dependency) error {
+	// mapping to see if we visited a parent directory already
+	visited := make(map[string]bool)
 	ok := true
 	for _, dep := range deps {
 		srcdir := filepath.Join(dep.ws, "src")
@@ -276,37 +344,85 @@ func copySrc(dir string, deps []Dependency) error {
 			log.Println(err)
 			ok = false
 		}
+
+		// copy actual dependency
+		vf := dep.vcs.listFiles(dep.dir)
 		w := fs.Walk(dep.dir)
 		for w.Step() {
-			err = copyPkgFile(dir, srcdir, w)
+			err = copyPkgFile(vf, dir, srcdir, w)
 			if err != nil {
 				log.Println(err)
 				ok = false
 			}
 		}
+
+		// Look for legal files in root
+		//  some packages are imports as a sub-package but license info
+		//  is at root:  exampleorg/common has license file in exampleorg
+		//
+		if dep.ImportPath == dep.root {
+			// we are already at root
+			continue
+		}
+
+		// prevent copying twice This could happen if we have
+		//   two subpackages listed someorg/common and
+		//   someorg/anotherpack which has their license in
+		//   the parent dir of someorg
+		rootdir := filepath.Join(srcdir, filepath.FromSlash(dep.root))
+		if visited[rootdir] {
+			continue
+		}
+		visited[rootdir] = true
+		vf = dep.vcs.listFiles(rootdir)
+		w = fs.Walk(rootdir)
+		for w.Step() {
+			fname := filepath.Base(w.Path())
+			if IsLegalFile(fname) && !strings.Contains(w.Path(), sep) {
+				err = copyPkgFile(vf, dir, srcdir, w)
+				if err != nil {
+					log.Println(err)
+					ok = false
+				}
+			}
+		}
 	}
+
 	if !ok {
-		return errors.New("error copying source code")
+		return errorCopyingSourceCode
 	}
+
 	return nil
 }
 
-func copyPkgFile(dstroot, srcroot string, w *fs.Walker) error {
+func copyPkgFile(vf vcsFiles, dstroot, srcroot string, w *fs.Walker) error {
 	if w.Err() != nil {
 		return w.Err()
 	}
-	if c := w.Stat().Name()[0]; c == '.' || c == '_' {
-		// Skip directories using a rule similar to how
-		// the go tool enumerates packages.
-		// See $GOROOT/src/cmd/go/main.go:/matchPackagesInFs
-		w.SkipDir()
-	}
+	name := w.Stat().Name()
 	if w.Stat().IsDir() {
+		if name[0] == '.' || name[0] == '_' || (!saveT && name == "testdata") {
+			// Skip directories starting with '.' or '_' or
+			// 'testdata' (last is only skipped if saveT is false)
+			w.SkipDir()
+		}
 		return nil
 	}
 	rel, err := filepath.Rel(srcroot, w.Path())
 	if err != nil { // this should never happen
 		return err
+	}
+	if !saveT && strings.HasSuffix(name, "_test.go") {
+		if verbose {
+			log.Printf("save: skipping test file: %s", w.Path())
+		}
+		return nil
+	}
+	if !vf.Contains(w.Path()) {
+		if verbose {
+			log.Printf("save: skipping untracked file: %s", w.Path())
+		}
+		return nil
 	}
 	return copyFile(filepath.Join(dstroot, rel), w.Path())
 }
@@ -409,7 +525,7 @@ func stripImportComment(line []byte) []byte {
 // It logs any errors it encounters.
 func writeVCSIgnore(dir string) {
 	// Currently git is the only VCS for which we know how to do this.
-	// Mercurial and Bazaar have similar mechasims, but they apparently
+	// Mercurial and Bazaar have similar mechanisms, but they apparently
 	// require writing files outside of dir.
 	const ignore = "/pkg\n/bin\n"
 	name := filepath.Join(dir, ".gitignore")
@@ -430,6 +546,7 @@ func writeFile(name, body string) error {
 }
 
 const (
+	// Readme contains the README text.
 	Readme = `
 This directory tree is generated automatically by godep.
 

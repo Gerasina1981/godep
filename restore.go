@@ -1,64 +1,175 @@
 package main
 
 import (
+	"errors"
+	"go/build"
 	"log"
 	"os"
 	"path/filepath"
+
+	"github.com/tools/godep/Godeps/_workspace/src/golang.org/x/tools/go/vcs"
 )
 
 var cmdRestore = &Command{
-	Usage: "restore",
+	Name:  "restore",
 	Short: "check out listed dependency versions in GOPATH",
 	Long: `
 Restore checks out the Godeps-specified version of each package in GOPATH.
+
 `,
 	Run: runRestore,
 }
 
+// Three phases:
+// 1. Download all deps
+// 2. Restore all deps (checkout the recorded rev)
+// 3. Attempt to load all deps as a simple consistency check
 func runRestore(cmd *Command, args []string) {
-	g, err := ReadAndLoadGodeps(findGodepsJSON())
+	var hadError bool
+	checkErr := func(s string) {
+		if hadError {
+			log.Println(s)
+			os.Exit(1)
+		}
+	}
+
+	g, err := loadDefaultGodepsFile()
 	if err != nil {
 		log.Fatalln(err)
 	}
-	hadError := false
+	for i, dep := range g.Deps {
+		verboseln("Downloading dependency (if needed):", dep.ImportPath)
+		err := download(&dep)
+		if err != nil {
+			log.Printf("error downloading dep (%s): %s\n", dep.ImportPath, err)
+			hadError = true
+		}
+		g.Deps[i] = dep
+	}
+	checkErr("Error downloading some deps. Aborting restore and check.")
 	for _, dep := range g.Deps {
+		verboseln("Restoring dependency (if needed):", dep.ImportPath)
 		err := restore(dep)
 		if err != nil {
-			log.Println("restore:", err)
+			log.Printf("error restoring dep (%s): %s\n", dep.ImportPath, err)
 			hadError = true
 		}
 	}
-	if hadError {
-		os.Exit(1)
+	checkErr("Error restoring some deps. Aborting check.")
+	for _, dep := range g.Deps {
+		verboseln("Checking dependency:", dep.ImportPath)
+		_, err := LoadPackages(dep.ImportPath)
+		if err != nil {
+			log.Printf("Dep (%s) restored, but was unable to load it with error:\n\t%s\n", dep.ImportPath, err)
+			if me, ok := err.(errorMissingDep); ok {
+				log.Println("\tThis may be because the dependencies were saved with an older version of godep (< v33).")
+				log.Printf("\tTry `go get %s`. Then `godep save` to update deps.\n", me.i)
+			}
+			hadError = true
+		}
 	}
+	checkErr("Error checking some deps.")
 }
 
-// restore downloads the given dependency and checks out
-// the given revision.
+var downloaded = make(map[string]bool)
+
+// download downloads the given dependency.
+// 2 Passes: 1) go get -d <pkg>, 2) git pull (if necessary)
+func download(dep *Dependency) error {
+
+	rr, err := vcs.RepoRootForImportPath(dep.ImportPath, debug)
+	if err != nil {
+		debugln("Error determining repo root for", dep.ImportPath)
+		return err
+	}
+	ppln("rr", rr)
+
+	dep.vcs = cmd[rr.VCS]
+
+	// try to find an existing directory in the GOPATHs
+	for _, gp := range filepath.SplitList(build.Default.GOPATH) {
+		t := filepath.Join(gp, "src", rr.Root)
+		fi, err := os.Stat(t)
+		if err != nil {
+			continue
+		}
+		if fi.IsDir() {
+			dep.root = t
+			break
+		}
+	}
+
+	// If none found, just pick the first GOPATH entry (AFAICT that's what go get does)
+	if dep.root == "" {
+		dep.root = filepath.Join(filepath.SplitList(build.Default.GOPATH)[0], "src", rr.Root)
+	}
+	ppln("dep", dep)
+
+	if downloaded[rr.Repo] {
+		verboseln("Skipping already downloaded repo", rr.Repo)
+		return nil
+	}
+
+	fi, err := os.Stat(dep.root)
+	if err != nil {
+		if os.IsNotExist(err) {
+			if err := os.MkdirAll(filepath.Dir(dep.root), os.ModePerm); err != nil {
+				debugln("Error creating base dir of", dep.root)
+				return err
+			}
+			err := rr.VCS.CreateAtRev(dep.root, rr.Repo, dep.Rev)
+			debugln("CreatedAtRev", dep.root, rr.Repo, dep.Rev)
+			if err != nil {
+				debugln("CreateAtRev error", err)
+				return err
+			}
+			downloaded[rr.Repo] = true
+			return nil
+		}
+		debugln("Error checking repo root for", dep.ImportPath, "at", dep.root, ":", err)
+		return err
+	}
+
+	if !fi.IsDir() {
+		return errors.New("repo root src dir exists, but isn't a directory for " + dep.ImportPath + " at " + dep.root)
+	}
+
+	if !dep.vcs.exists(dep.root, dep.Rev) {
+		debugln("Updating existing", dep.root)
+		dep.vcs.vcs.Download(dep.root)
+		downloaded[rr.Repo] = true
+	}
+
+	debugln("Nothing to download")
+	return nil
+}
+
+var restored = make(map[string]string) // dep.root -> dep.Rev
+
+// restore checks out the given revision.
 func restore(dep Dependency) error {
-	// make sure pkg exists somewhere in GOPATH
-	err := runIn(".", "go", "get", "-d", dep.ImportPath)
-	if err != nil {
-		return err
+	rev, ok := restored[dep.root]
+	debugln(rev)
+	debugln(ok)
+	debugln(dep.root)
+	if ok {
+		if rev != dep.Rev {
+			return errors.New("Wanted to restore rev " + dep.Rev + ", already restored rev " + rev + " for another package in the repo")
+		}
+		verboseln("Skipping already restored repo")
+		return nil
 	}
-	ps, err := LoadPackages(dep.ImportPath)
-	if err != nil {
-		return err
-	}
-	pkg := ps[0]
-	if !dep.vcs.exists(pkg.Dir, dep.Rev) {
-		dep.vcs.vcs.Download(pkg.Dir)
-	}
-	return dep.vcs.RevSync(pkg.Dir, dep.Rev)
-}
 
-func findGodepsJSON() (path string) {
-	dir, isDir := findGodeps()
-	if dir == "" {
-		log.Fatalln("No Godeps found (or in any parent directory)")
+	debugln("Restoring:", dep.ImportPath, dep.Rev)
+	pkg, err := build.Import(dep.ImportPath, ".", build.FindOnly)
+	if err != nil {
+		// This should never happen
+		debugln("Error finding package "+dep.ImportPath+" on restore:", err)
+		return err
 	}
-	if isDir {
-		return filepath.Join(dir, "Godeps", "Godeps.json")
+	err = dep.vcs.RevSync(pkg.Dir, dep.Rev)
+	if err == nil {
+		restored[dep.root] = dep.Rev
 	}
-	return filepath.Join(dir, "Godeps")
+	return err
 }

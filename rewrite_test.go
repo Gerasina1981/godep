@@ -7,6 +7,7 @@ import (
 )
 
 func TestUnqualify(t *testing.T) {
+	setGlobals(false)
 	var cases = []struct {
 		path string
 		want string
@@ -218,11 +219,32 @@ func TestRewrite(t *testing.T) {
 				{"C/main.go", sortOrderPreserveCommentRewritten, nil},
 			},
 		},
+		{ // testdata directory is copied unmodified.
+			cwd:   "C",
+			paths: []string{"D"},
+			start: []*node{
+				{"C/main.go", pkg("main", "D"), nil},
+				{"C/testdata", "",
+					[]*node{
+						{"badpkg.go", "//", nil},
+					},
+				},
+			},
+			want: []*node{
+				{"C/main.go", pkg("main", "C/Godeps/_workspace/src/D"), nil},
+				{"C/testdata", "",
+					[]*node{
+						{"badpkg.go", "//", nil},
+					},
+				},
+			},
+		},
 	}
 
 	const gopath = "godeptest"
 	defer os.RemoveAll(gopath)
-	for _, test := range cases {
+	for pos, test := range cases {
+		setGlobals(false)
 		err := os.RemoveAll(gopath)
 		if err != nil {
 			t.Fatal(err)
@@ -241,6 +263,6 @@ func TestRewrite(t *testing.T) {
 			t.Errorf("Unexpected tempfiles: %+v", tempFiles)
 		}
 
-		checkTree(t, &node{src, "", test.want})
+		checkTree(t, pos, &node{src, "", test.want})
 	}
 }

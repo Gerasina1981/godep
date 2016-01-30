@@ -12,16 +12,52 @@ import (
 
 func TestUpdate(t *testing.T) {
 	var cases = []struct {
-		cwd   string
-		args  []string
-		start []*node
-		want  []*node
-		wdep  Godeps
-		werr  bool
+		cwd    string
+		args   []string
+		vendor bool
+		start  []*node
+		want   []*node
+		wdep   Godeps
+		werr   bool
 	}{
 		{ // simple case, update one dependency
 			cwd:  "C",
 			args: []string{"D"},
+			start: []*node{
+				{
+					"D",
+					"",
+					[]*node{
+						{"main.go", pkg("D") + decl("D1"), nil},
+						{"+git", "D1", nil},
+						{"main.go", pkg("D") + decl("D2"), nil},
+						{"+git", "D2", nil},
+					},
+				},
+				{
+					"C",
+					"",
+					[]*node{
+						{"main.go", pkg("main", "D"), nil},
+						{"Godeps/Godeps.json", godeps("C", "D", "D1"), nil},
+						{"Godeps/_workspace/src/D/main.go", pkg("D") + decl("D1"), nil},
+						{"+git", "", nil},
+					},
+				},
+			},
+			want: []*node{
+				{"C/Godeps/_workspace/src/D/main.go", pkg("D") + decl("D2"), nil},
+			},
+			wdep: Godeps{
+				ImportPath: "C",
+				Deps: []Dependency{
+					{ImportPath: "D", Comment: "D2"},
+				},
+			},
+		},
+		{ // simple case, update one dependency, trailing slash
+			cwd:  "C",
+			args: []string{"D/"},
 			start: []*node{
 				{
 					"D",
@@ -372,7 +408,8 @@ func TestUpdate(t *testing.T) {
 	}
 	const gopath = "godeptest"
 	defer os.RemoveAll(gopath)
-	for _, test := range cases {
+	for pos, test := range cases {
+		setGlobals(test.vendor)
 		err = os.RemoveAll(gopath)
 		if err != nil {
 			t.Fatal(err)
@@ -385,10 +422,7 @@ func TestUpdate(t *testing.T) {
 		if err != nil {
 			panic(err)
 		}
-		err = os.Setenv("GOPATH", filepath.Join(wd, gopath))
-		if err != nil {
-			panic(err)
-		}
+		setGOPATH(filepath.Join(wd, gopath))
 		log.SetOutput(ioutil.Discard)
 		err = update(test.args)
 		log.SetOutput(os.Stderr)
@@ -400,7 +434,7 @@ func TestUpdate(t *testing.T) {
 			panic(err)
 		}
 
-		checkTree(t, &node{src, "", test.want})
+		checkTree(t, pos, &node{src, "", test.want})
 
 		f, err := os.Open(filepath.Join(dir, "Godeps/Godeps.json"))
 		if err != nil {

@@ -6,20 +6,32 @@ import (
 	"io"
 	"log"
 	"os"
+	"runtime/pprof"
 	"strings"
 	"text/template"
 )
 
-// A Command is an implementation of a godep command
+var (
+	cpuprofile       string
+	verbose          bool // Verbose flag for commands that support it
+	debug            bool // Debug flag for commands that support it
+	majorGoVersion   string
+	VendorExperiment bool
+	sep              string
+)
+
+// Command is an implementation of a godep command
 // like godep save or godep go.
 type Command struct {
 	// Run runs the command.
 	// The args are the arguments after the command name.
 	Run func(cmd *Command, args []string)
 
-	// Usage is the one-line usage message.
-	// The first word in the line is taken to be the command name.
-	Usage string
+	// Name of the command
+	Name string
+
+	// Args the command would expect
+	Args string
 
 	// Short is the short description shown in the 'godep help' output.
 	Short string
@@ -32,18 +44,10 @@ type Command struct {
 	Flag flag.FlagSet
 }
 
-func (c *Command) Name() string {
-	name := c.Usage
-	i := strings.Index(name, " ")
-	if i >= 0 {
-		name = name[:i]
-	}
-	return name
-}
-
+// UsageExit prints usage information and exits.
 func (c *Command) UsageExit() {
-	fmt.Fprintf(os.Stderr, "Usage: godep %s\n\n", c.Usage)
-	fmt.Fprintf(os.Stderr, "Run 'godep help %s' for help.\n", c.Name())
+	fmt.Fprintf(os.Stderr, "Args: godep %s [-v] [-d] %s\n\n", c.Name, c.Args)
+	fmt.Fprintf(os.Stderr, "Run 'godep help %s' for help.\n", c.Name)
 	os.Exit(2)
 }
 
@@ -58,6 +62,7 @@ var commands = []*Command{
 	cmdRestore,
 	cmdUpdate,
 	cmdDiff,
+	cmdVersion,
 }
 
 func main() {
@@ -75,10 +80,41 @@ func main() {
 		return
 	}
 
+	var err error
+	majorGoVersion, err = goVersion()
+	if err != nil {
+		log.Fatal(err)
+	}
+
+	// VendorExperiment is the Go 1.5 vendor directory experiment flag, see
+	// https://github.com/golang/go/commit/183cc0cd41f06f83cb7a2490a499e3f9101befff
+	VendorExperiment = (majorGoVersion == "go1.5" && os.Getenv("GO15VENDOREXPERIMENT") == "1") ||
+		(majorGoVersion == "go1.6" && os.Getenv("GO15VENDOREXPERIMENT") != "0")
+
+	// sep is the signature set of path elements that
+	// precede the original path of an imported package.
+	sep = defaultSep(VendorExperiment)
+
 	for _, cmd := range commands {
-		if cmd.Name() == args[0] {
+		if cmd.Name == args[0] {
+			cmd.Flag.BoolVar(&verbose, "v", false, "enable verbose output")
+			cmd.Flag.BoolVar(&debug, "d", false, "enable debug output")
+			cmd.Flag.StringVar(&cpuprofile, "cpuprofile", "", "Write cpu profile to this file")
 			cmd.Flag.Usage = func() { cmd.UsageExit() }
 			cmd.Flag.Parse(args[1:])
+
+			debugln("majorGoVersion", majorGoVersion)
+			debugln("VendorExperiment", VendorExperiment)
+			debugln("sep", sep)
+
+			if cpuprofile != "" {
+				f, err := os.Create(cpuprofile)
+				if err != nil {
+					log.Fatal(err)
+				}
+				pprof.StartCPUProfile(f)
+				defer pprof.StopCPUProfile()
+			}
 			cmd.Run(cmd, cmd.Flag.Args())
 			return
 		}
@@ -104,9 +140,14 @@ Use "godep help [command]" for more information about a command.
 `
 
 var helpTemplate = `
-Usage: godep {{.Usage}}
+Args: godep {{.Name}} [-v] [-d] {{.Args}}
 
 {{.Long | trim}}
+
+If -v is given, verbose output is enabled.
+
+If -d is given, debug output is enabled (you probably don't want this, see -v).
+
 `
 
 func help(args []string) {
@@ -120,7 +161,7 @@ func help(args []string) {
 		os.Exit(2)
 	}
 	for _, cmd := range commands {
-		if cmd.Name() == args[0] {
+		if cmd.Name == args[0] {
 			tmpl(os.Stdout, helpTemplate, cmd)
 			return
 		}

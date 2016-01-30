@@ -1,53 +1,92 @@
 package main
 
 import (
-	"errors"
 	"go/parser"
 	"go/token"
 	"log"
 	"os"
+	"path"
 	"path/filepath"
-	"regexp"
 	"strconv"
 	"strings"
 )
 
 var cmdUpdate = &Command{
-	Usage: "update [packages]",
-	Short: "use different revision of selected packages",
+	Name:  "update",
+	Args:  "[-goversion] [packages]",
+	Short: "update selected packages or the go version",
 	Long: `
 Update changes the named dependency packages to use the
 revision of each currently installed in GOPATH. New code will
-be copied into Godeps and the new revision will be written to
-the manifest.
+be copied into the Godeps workspace or vendor folder and the 
+new revision will be written to the manifest.
+
+If -goversion is specified, update the recorded go version. 
 
 For more about specifying packages, see 'go help packages'.
 `,
 	Run: runUpdate,
 }
+var (
+	updateGoVer bool
+)
+
+func init() {
+	cmdUpdate.Flag.BoolVar(&saveT, "t", false, "save test files during update")
+	cmdUpdate.Flag.BoolVar(&updateGoVer, "goversion", false, "update the recorded go version")
+}
 
 func runUpdate(cmd *Command, args []string) {
-	err := update(args)
-	if err != nil {
-		log.Fatalln(err)
+	if updateGoVer {
+		err := updateGoVersion()
+		if err != nil {
+			log.Fatalln(err)
+		}
 	}
+	if len(args) > 0 {
+		err := update(args)
+		if err != nil {
+			log.Fatalln(err)
+		}
+	}
+}
+
+func updateGoVersion() error {
+	gold, err := loadDefaultGodepsFile()
+	if err != nil {
+		if !os.IsNotExist(err) {
+			return err
+		}
+	}
+	cv, err := goVersion()
+	if err != nil {
+		return err
+	}
+
+	gv := gold.GoVersion
+	gold.GoVersion = cv
+	_, err = gold.save()
+	if err != nil {
+		return err
+	}
+
+	if gv != cv {
+		log.Println("Updated major go version to", cv)
+	}
+	return nil
+
 }
 
 func update(args []string) error {
 	if len(args) == 0 {
 		args = []string{"."}
 	}
-	var g Godeps
-	manifest := filepath.Join("Godeps", "Godeps.json")
-	err := ReadGodeps(manifest, &g)
-	if os.IsNotExist(err) {
-		manifest = "Godeps"
-		err = ReadGodeps(manifest, &g)
-	}
+	g, err := loadDefaultGodepsFile()
 	if err != nil {
 		return err
 	}
 	for _, arg := range args {
+		arg := path.Clean(arg)
 		any := markMatches(arg, g.Deps)
 		if !any {
 			log.Println("not in manifest:", arg)
@@ -58,24 +97,15 @@ func update(args []string) error {
 		return err
 	}
 	if len(deps) == 0 {
-		return errors.New("no packages can be updated")
+		return errorNoPackagesUpdatable
 	}
-	f, err := os.Create(manifest)
-	if err != nil {
+	if _, err = g.save(); err != nil {
 		return err
 	}
-	_, err = g.WriteTo(f)
-	if err != nil {
-		return err
-	}
-	err = f.Close()
-	if err != nil {
-		return err
-	}
-	if manifest != "Godeps" {
-		srcdir := filepath.FromSlash("Godeps/_workspace/src")
-		copySrc(srcdir, deps)
-	}
+
+	srcdir := relativeVendorTarget(VendorExperiment)
+	copySrc(srcdir, deps)
+
 	ok, err := needRewrite(g.Packages)
 	if err != nil {
 		return err
@@ -140,24 +170,7 @@ func markMatches(pat string, deps []Dependency) (matched bool) {
 	return matched
 }
 
-// matchPattern(pattern)(name) reports whether
-// name matches pattern.  Pattern is a limited glob
-// pattern in which '...' means 'any string' and there
-// is no other special syntax.
-// Taken from $GOROOT/src/cmd/go/main.go.
-func matchPattern(pattern string) func(name string) bool {
-	re := regexp.QuoteMeta(pattern)
-	re = strings.Replace(re, `\.\.\.`, `.*`, -1)
-	// Special case: foo/... matches foo too.
-	if strings.HasSuffix(re, `/.*`) {
-		re = re[:len(re)-len(`/.*`)] + `(/.*)?`
-	}
-	reg := regexp.MustCompile(`^` + re + `$`)
-	return func(name string) bool {
-		return reg.MatchString(name)
-	}
-}
-
+// LoadVCSAndUpdate loads and updates a set of dependencies.
 func LoadVCSAndUpdate(deps []Dependency) ([]Dependency, error) {
 	var err1 error
 	var paths []string
@@ -181,18 +194,18 @@ func LoadVCSAndUpdate(deps []Dependency) ([]Dependency, error) {
 		}
 		if dep.pkg == nil {
 			log.Println(dep.ImportPath + ": error listing package")
-			err1 = errors.New("error loading dependencies")
+			err1 = errorLoadingDeps
 			continue
 		}
 		if dep.pkg.Error.Err != "" {
 			log.Println(dep.pkg.Error.Err)
-			err1 = errors.New("error loading dependencies")
+			err1 = errorLoadingDeps
 			continue
 		}
 		vcs, reporoot, err := VCSFromDir(dep.pkg.Dir, filepath.Join(dep.pkg.Root, "src"))
 		if err != nil {
 			log.Println(err)
-			err1 = errors.New("error loading dependencies")
+			err1 = errorLoadingDeps
 			continue
 		}
 		dep.dir = dep.pkg.Dir
@@ -218,12 +231,12 @@ func LoadVCSAndUpdate(deps []Dependency) ([]Dependency, error) {
 		id, err := dep.vcs.identify(dep.pkg.Dir)
 		if err != nil {
 			log.Println(err)
-			err1 = errors.New("error loading dependencies")
+			err1 = errorLoadingDeps
 			continue
 		}
 		if dep.vcs.isDirty(dep.pkg.Dir, id) {
-			log.Println("dirty working tree:", dep.pkg.Dir)
-			err1 = errors.New("error loading dependencies")
+			log.Println("dirty working tree (please commit changes):", dep.pkg.Dir)
+			err1 = errorLoadingDeps
 			break
 		}
 		dep.Rev = id

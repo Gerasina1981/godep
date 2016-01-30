@@ -1,7 +1,7 @@
 package main
 
 import (
-	"os"
+	"fmt"
 	"os/exec"
 )
 
@@ -10,9 +10,19 @@ import (
 // Stdout, stderr, and the environment are inherited
 // from the current process.
 func runIn(dir, name string, args ...string) error {
+	_, err := runInWithOutput(dir, name, args...)
+	return err
+}
+
+func runInWithOutput(dir, name string, args ...string) (string, error) {
 	c := exec.Command(name, args...)
 	c.Dir = dir
-	c.Stdout = os.Stdout
-	c.Stderr = os.Stderr
-	return c.Run()
+	o, err := c.CombinedOutput()
+
+	if debug {
+		fmt.Printf("execute: %+v\n", c)
+		fmt.Printf(" output: %s\n", string(o))
+	}
+
+	return string(o), err
 }

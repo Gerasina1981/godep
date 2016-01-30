@@ -9,20 +9,18 @@ import (
 )
 
 var cmdDiff = &Command{
-	Usage: "diff",
+	Name:  "diff",
 	Short: "shows the diff between current and previously saved set of dependencies",
 	Long: `
-Shows the difference, in a unified diff format, between the 
-current set of dependencies and those generated on a 
+Shows the difference, in a unified diff format, between the
+current set of dependencies and those generated on a
 previous 'go save' execution.
 `,
 	Run: runDiff,
 }
 
 func runDiff(cmd *Command, args []string) {
-	var gold Godeps
-
-	_, err := readOldGodeps(&gold)
+	gold, err := loadDefaultGodepsFile()
 	if err != nil {
 		log.Fatalln(err)
 	}
@@ -33,17 +31,12 @@ func runDiff(cmd *Command, args []string) {
 		log.Fatalln(err)
 	}
 
-	ver, err := goVersion()
-	if err != nil {
-		log.Fatalln(err)
-	}
-
 	gnew := &Godeps{
 		ImportPath: dot[0].ImportPath,
-		GoVersion:  ver,
+		GoVersion:  gold.GoVersion,
 	}
 
-	err = gnew.Load(dot)
+	err = gnew.fill(dot, dot[0].ImportPath)
 	if err != nil {
 		log.Fatalln(err)
 	}
@@ -59,12 +52,12 @@ func runDiff(cmd *Command, args []string) {
 func diffStr(a, b *Godeps) (string, error) {
 	var ab, bb bytes.Buffer
 
-	_, err := a.WriteTo(&ab)
+	_, err := a.writeTo(&ab)
 	if err != nil {
 		log.Fatalln(err)
 	}
 
-	_, err = b.WriteTo(&bb)
+	_, err = b.writeTo(&bb)
 	if err != nil {
 		log.Fatalln(err)
 	}
@@ -72,7 +65,7 @@ func diffStr(a, b *Godeps) (string, error) {
 	diff := difflib.UnifiedDiff{
 		A:        difflib.SplitLines(ab.String()),
 		B:        difflib.SplitLines(bb.String()),
-		FromFile: "Godeps",
+		FromFile: b.file(),
 		ToFile:   "$GOPATH",
 		Context:  10,
 	}
