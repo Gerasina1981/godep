@@ -70,9 +70,22 @@ func uniq(a []string) []string {
 
 // trimGoVersion and return the major version
 func trimGoVersion(version string) (string, error) {
+	if version == "devel" {
+		return "devel", nil
+	}
 	p := strings.Split(version, ".")
 	if len(p) < 2 {
 		return "", fmt.Errorf("Error determing major go version from: %q", version)
+	}
+	var split string
+	switch {
+	case strings.Contains(p[1], "beta"):
+		split = "beta"
+	case strings.Contains(p[1], "rc"):
+		split = "rc"
+	}
+	if split != "" {
+		p[1] = strings.Split(p[1], split)[0]
 	}
 	return p[0] + "." + p[1], nil
 }

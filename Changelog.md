@@ -1,3 +1,36 @@
+# v52 2016/01/27
+
+* Trim 'rc' out of go version strings when determining major version.
+
+# v51 2016/01/21
+
+* Trim 'beta' out of go version strings when determining major version.
+
+# v50 2016/01/19
+
+* More verbose output on save -v.
+
+# v49 2016/01/13
+
+* Add UK spelling license/licence to the pile + fix up a bunch of typos 
+* Clarify tag handling in docs
+
+# v48 2016/01/13
+
+* Abort restore if there is no $GOPATH set.
+
+# v47 2016/01/12
+
+* Dev versions of go should honor the current meaning of GO15VENDOREXPERIMENT
+
+# v46 2016/01/03
+
+* Record "devel" when the release is a devel release of go (compiled from git).
+
+# v45 2015/12/28
+
+* Upcase windows drive letters before comparing. Fixes #383.
+
 # v44 2015/12/23
 
 * Clean package roots when attempting to find a vendor directory so we don't loop forever.
@@ -74,10 +107,12 @@
     * #350: undefined: build.MultiplePackageError
     * #351: stow away helper files
     * #353: cannot find package "appengine"
+        * Don't process imports of `.go` files tagged with the `appengine` build tag.
 
 # v33 2015/12/07
 
 * Replace the use of `go list`. This is a large change although all existing tests pass.
+    * Don't process the imports of `.go` files with the `ignore` build tag.
 
 # v32 2015/12/02
 
@@ -119,27 +154,27 @@
 
 * Do not use --debug to find full revision name for mercurial repositories
 
-# v22 2016/11/14
+# v22 2015/11/14
 
 * s/GOVENDOREXPERIMENT/GO15VENDOREXPERIMENT :-(
 
-# v21 2016/11/13
+# v21 2015/11/13
 
 * Fix #310: Case insensitive fs issue
 
-# v20 2016/11/13
+# v20 2015/11/13
 
 * Attempt to include license files when vendoring. (@client9)
 
-# v19 2016/11/3
+# v19 2015/11/3
 
 * Fix conflict error message. Revisions were swapped. Also better selection of package that needs update.
 
-# v18 2016/10/16
+# v18 2015/10/16
 
 * Improve error message when trying to save a conflicting revision.
 
-# v17 2016/10/15
+# v17 2015/10/15
 
 * Fix for v16 bug. All vcs list commands now produce paths relative to the root of the vcs.
 
